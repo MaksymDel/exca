@@ -97,6 +97,7 @@ class SubmititMixin(pydantic.BaseModel):
     # other
     conda_env: Path | str | None = None  # conda env name or path
     workdir: None | WorkDir = None
+    envcoms: tp.List[str] | None = None  # New field for additional setup commands
 
     def model_post_init(self, log__: tp.Any) -> None:
         super().model_post_init(log__)
@@ -115,11 +116,11 @@ class SubmititMixin(pydantic.BaseModel):
                 msg = "Currently you must set slurm_use_srun=True if tasks_per_node > 1\n"
                 msg += "(this implies that your job won't be able to run spawn sub-jobs)"
                 raise ValueError(msg)
-        if self.conda_env is not None:
+        if self.conda_env or self.envcoms is not None:
             acceptable = list(SUBMITIT_EXECUTORS)
             acceptable.remove("debug")  # not reloading the environment
             if self.cluster not in acceptable:
-                msg = f"Cannot specify a conda env for cluster {self.cluster}, acceptable: {acceptable}"
+                msg = f"Cannot specify a conda env and envcoms for cluster {self.cluster}, acceptable: {acceptable}"
                 raise ValueError(msg)
 
     def executor(self) -> None | submitit.AutoExecutor:
@@ -130,7 +131,7 @@ class SubmititMixin(pydantic.BaseModel):
             cluster = None
         logpath = self._log_path()
         executor = submitit.AutoExecutor(folder=logpath, cluster=cluster)
-        non_submitit = {"cluster", "logs", "conda_env", "workdir", "folder"}
+        non_submitit = {"cluster", "logs", "conda_env", "workdir", "folder", "envcoms"}
         fields = set(SubmititMixin.model_fields) - non_submitit  # type: ignore
         _missing = base.Sentinel()  # for backward compatibility when adding a new param
         params = {name: getattr(self, name, _missing) for name in fields}
@@ -138,6 +139,11 @@ class SubmititMixin(pydantic.BaseModel):
         params["name"] = params.pop("job_name")
         params = {name: val for name, val in params.items() if val is not None}
         executor.update_parameters(**params)
+
+        setup_cmds = []
+        if self.envcoms:
+            setup_cmds.extend(self.envcoms)
+
         if self.conda_env is not None:
             string = subprocess.check_output(
                 "conda info --base".split(), shell=False
@@ -145,12 +151,15 @@ class SubmititMixin(pydantic.BaseModel):
             cfile = Path(string.strip()) / "etc/profile.d/conda.sh"
             if not cfile.exists():
                 raise RuntimeError(f"conda file to source does not exist: {cfile}")
-            cmds = [
+            setup_cmds.extend([
                 f". {cfile.absolute()}",
                 "conda deactivate",
                 f"conda activate {self.conda_env}",
-            ]
-            executor.update_parameters(**{f"{executor.cluster}_setup": cmds})
+            ])
+
+        if setup_cmds:
+            executor.update_parameters(**{f"{executor.cluster}_setup": setup_cmds})
+        
         if self.job_name is None and executor is not None:
             if isinstance(self, base.BaseInfra):
                 cname = self._obj.__class__.__name__
